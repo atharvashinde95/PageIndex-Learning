@@ -509,6 +509,30 @@ def list_to_tree(sections: List[Dict]) -> List[Dict]:
     return root_nodes
 
 
+def structure_sort_key(struct_str: str) -> list:
+    """
+    Sort key for section structure IDs so they sort numerically, not lexically.
+
+    Examples:
+      "5.11" -> [5, 11]  (NOT after "5.9" lexically, but correct numerically)
+      "6.2.7" -> [6, 2, 7]
+      "10"    -> [10]    (NOT before "2" lexically)
+
+    This is critical for list_to_tree() to receive sections in the correct order
+    so that parent-child nesting works. Sorting by start_index alone fails when
+    a subsection has a wrong/early page number (e.g. 5.11 on page 22, before
+    chapter 5 which starts on page 23).
+    """
+    parts = str(struct_str).split(".")
+    result = []
+    for p in parts:
+        try:
+            result.append(int(p))
+        except ValueError:
+            result.append(0)
+    return result
+
+
 def assign_node_ids(tree: List[Dict], counter: List[int] = None) -> None:
     """
     Depth-first traversal assigning zero-padded 4-digit node IDs.
@@ -537,21 +561,57 @@ def add_node_text(tree: List[Dict], pages: List[Tuple[int, str]]) -> None:
         add_node_text(node.get("children", []), pages)
 
 
+def _flatten_tree(nodes: List[Dict]) -> List[Dict]:
+    """Flatten a nested tree into a list (depth-first) for batch processing."""
+    result = []
+    for node in nodes:
+        result.append(node)
+        result.extend(_flatten_tree(node.get("children", [])))
+    return result
+
+
 def add_node_summary(tree: List[Dict]) -> None:
-    """Generate a short LLM summary for each node from its text."""
-    for node in tree:
+    """
+    Generate a short LLM summary for EVERY node in the tree.
+
+    Rate-limit strategy: flatten the whole tree first, then process nodes
+    one-by-one with the THROTTLE_DELAY in call_llm() providing spacing between
+    calls. If a 429 is still hit, call_llm() retries with exponential backoff
+    automatically (no nodes are skipped).
+
+    Every node gets a real LLM summary — this is important for retrieval quality
+    because the retriever uses summaries to navigate the tree.
+    """
+    all_nodes = _flatten_tree(tree)
+    total = len(all_nodes)
+    logger.info("add_node_summary: generating summaries for %d nodes", total)
+
+    for i, node in enumerate(all_nodes):
         text = node.get("text", "")
-        if text:
-            prompt = f"""Summarize the following document section in 2–3 sentences.
-Be specific: mention key topics, numbers, or entities. Be concise.
-Section title: {node.get('title', '')}
-Section text:
-{text[:3000]}
-Return only the summary text."""
-            node["summary"] = call_llm(prompt, max_tokens=256)
-        else:
+        if not text:
             node["summary"] = ""
-        add_node_summary(node.get("children", []))
+            continue
+
+        prompt = (
+            "Summarize the following document section in 2-3 sentences.\n"
+            "Be specific: mention key topics, numbers, or entities. Be concise.\n"
+            f"Section title: {node.get('title', '')}\n"
+            f"Section text:\n{text[:3000]}\n"
+            "Return only the summary text."
+        )
+        try:
+            node["summary"] = call_llm(prompt, max_tokens=256)
+            logger.info(
+                "add_node_summary: [%d/%d] summarised '%s'",
+                i + 1, total, node.get("title", ""),
+            )
+        except Exception as e:
+            # Last-resort fallback: use text snippet so indexing doesn't fail
+            logger.error(
+                "add_node_summary: [%d/%d] FAILED for '%s' — using text snippet. Error: %s",
+                i + 1, total, node.get("title", ""), e,
+            )
+            node["summary"] = text[:300].replace("\n", " ").strip()
 
 
 def add_doc_description(root_tree: List[Dict], pages: List[Tuple[int, str]]) -> str:
@@ -671,6 +731,11 @@ def build_index(
             sections[i]["end_index"] = total_pages
 
     # ── Step 5: Build Nested Tree ──────────────────────────────────────────────
+    # CRITICAL: Sort by structure ID (not start_index) before nesting.
+    # start_index can be wrong for subsections discovered during body scanning
+    # (e.g. 5.11 gets start_index=22, before chapter 5 which starts at page 23).
+    # Structure ID is always authoritative for parent-child relationships.
+    sections.sort(key=lambda s: structure_sort_key(s.get("structure", "")))
     tree = list_to_tree(sections)
     assign_node_ids(tree)
 
