@@ -3,11 +3,7 @@ import fitz
 from pathlib import Path
 from typing import List, Tuple
 
-# Matches lines like "2.1.  Problem definition  ...... 5" in TOC
 TOC_BLOCK = re.compile(r"(?m)^\s*\d{1,3}(?:\.\d{1,3}){0,4}\.\s+[A-Za-z].+$")
-
-# Minimum number of TOC-like lines on a page to consider it a TOC page
-TOC_LINE_THRESHOLD = 3
 
 
 def extract_pages(pdf_path: str) -> List[Tuple[int, str]]:
@@ -18,52 +14,41 @@ def extract_pages(pdf_path: str) -> List[Tuple[int, str]]:
         blocks = page.get_text("blocks")
         blocks.sort(key=lambda b: (b[1], b[0]))
 
-        lines = []
-        is_toc_page = False
-
+        # FIX: Pre-scan ALL lines across ALL blocks on this page first.
+        # The original code checked TOC hits per-block with a threshold of 3.
+        # When each TOC entry is its own single-line PDF block (very common),
+        # no individual block ever reaches 3 hits, so <<TOC_BLOCK>> is never
+        # added and heading_detector processes the TOC page as real content,
+        # creating ghost nodes pointing to the TOC page.
+        # Solution: count TOC-like lines across the ENTIRE page before processing.
+        all_page_lines = []
         for b in blocks:
             text = (b[4] or "").strip()
-            if not text:
-                continue
-            split = text.split("\n")
+            if text:
+                all_page_lines.extend(text.split("\n"))
 
-            # BUG FIX: detect TOC blocks on ANY page (not just page index 1).
-            # Original code only tagged page i==1 with <<TOC_BLOCK>>, but the
-            # heading regexes still ran and picked up TOC entries.  Now we
-            # tag the whole page as a TOC page so heading_detector skips it.
-            toc_hits = [l for l in split if TOC_BLOCK.match(l)]
-            if len(toc_hits) >= TOC_LINE_THRESHOLD:
-                is_toc_page = True
-                # Don't add TOC block lines – they would confuse the heading detector
-                continue
+        page_toc_hits = [l for l in all_page_lines if TOC_BLOCK.match(l)]
+        is_toc_page = len(page_toc_hits) >= 3
 
-            for l in split:
-                if l not in lines:
-                    lines.append(l)
-
-        # BUG FIX: Prepend the TOC marker so heading_detector.py can reliably
-        # detect and skip the whole page, regardless of page number.
+        lines = []
         if is_toc_page:
-            page_text = "<<TOC_BLOCK>>\n" + "\n".join(lines)
+            # Mark the entire page as TOC so heading_detector skips it completely.
+            # Removed the "if i == 1" guard — TOC can appear on any page.
+            lines.append("<<TOC_BLOCK>>")
         else:
-            page_text = "\n".join(lines)
+            for b in blocks:
+                text = (b[4] or "").strip()
+                if not text:
+                    continue
+                for l in text.split("\n"):
+                    if l not in lines:
+                        lines.append(l)
 
-        pages.append((i + 1, page_text))
+        pages.append((i + 1, "\n".join(lines)))
 
     doc.close()
     return pages
 
 
 def get_page_text(pages, s, e):
-    """Return concatenated text for pages in range [s, e] (inclusive).
-    Strips the TOC marker from any page that has it so it doesn't leak
-    into section text.
-    """
-    parts = []
-    for pn, text in pages:
-        if s <= pn <= e:
-            # Strip internal TOC marker if somehow present
-            clean = text.replace("<<TOC_BLOCK>>", "").strip()
-            if clean:
-                parts.append(clean)
-    return "\n\n".join(parts)
+    return "\n\n".join(text for pn, text in pages if s <= pn <= e)
