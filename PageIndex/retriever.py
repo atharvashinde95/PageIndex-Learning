@@ -121,14 +121,6 @@ def _score_node(doc: Dict[str, Any], query_tokens: List[str], clause_nums: List[
     depth = len(struct.split("."))
     score += max(0, 8 - depth) * 0.1
 
-    # Penalise nodes whose text is suspiciously short (< 300 chars).
-    # These are almost always ghost nodes generated from TOC or cover pages
-    # that ended up with the wrong start_index during index building.
-    # A real section always has at least a few hundred characters of content.
-    text_len = len(_norm(node.get("text") or ""))
-    if text_len < 300:
-        score *= 0.1
-
     return score
 
 def _pick_best_node(query: str, tree_root: Dict) -> Tuple[Optional[Dict], List[str]]:
@@ -144,39 +136,10 @@ def _pick_best_node(query: str, tree_root: Dict) -> Tuple[Optional[Dict], List[s
     scored.sort(key=lambda x: x[1], reverse=True)
 
     best_node, best_score = scored[0]
-    # Lowered from 2.2 → 0.5: the short-text penalty already zeros out ghost
-    # nodes, so we no longer need an aggressive threshold to filter them.
-    if best_score < 0.5:
+    if best_score < 2.2:
         return None, []
     path = _path_to_node(tree_root.get("children", []), best_node)
     return best_node, path
-
-
-def _pick_top_nodes(query: str, tree_root: Dict, top_n: int = 3) -> List[Tuple[Dict, List[str]]]:
-    """Return the top-N highest-scoring nodes.
-
-    Sending multiple relevant sections to the LLM lets it answer broad
-    questions (e.g. 'tell me about WANA') that span more than one section,
-    instead of always saying 'Not found in this section.'
-    """
-    nodes = _flatten(tree_root.get("children", []))
-    if not nodes:
-        return []
-    docs = _prepare_docs(nodes)
-
-    q_tokens    = _tokenize(query)
-    clause_nums = CLAUSE_RE.findall(query)
-
-    scored = [(doc["node"], _score_node(doc, q_tokens, clause_nums)) for doc in docs]
-    scored.sort(key=lambda x: x[1], reverse=True)
-
-    results = []
-    for node, score in scored[:top_n]:
-        if score < 0.5:
-            break
-        path = _path_to_node(tree_root.get("children", []), node)
-        results.append((node, path))
-    return results
 
 # ------------------------------
 # Strict extractive fallback (unchanged)
@@ -369,8 +332,15 @@ Answer:
     except Exception:
         ans = _extractive_fallback(query, combined)
 
-    # If strict pass succeeded with a real answer, return it
-    if ans and "Not found in this section." not in ans:
+    # If strict pass succeeded with a real answer, return it.
+    # Use a broad pattern — the LLM may phrase "not found" in many ways:
+    # "not found in this section", "cannot be found", "is not mentioned", etc.
+    NOT_FOUND_RE = re.compile(
+        r"not\s+found|cannot\s+be\s+found|no\s+(?:information|answer|mention|specific)|"
+        r"not\s+(?:mentioned|available|provided|specified|stated|discussed)",
+        re.I
+    )
+    if ans and not NOT_FOUND_RE.search(ans):
         return {
             "answer": ans,
             "section": title or "—",
@@ -406,7 +376,7 @@ Answer:
 
             inferred = _infer_from_evidence(query, evidence)
 
-        # If inference worked, return it
+        # If inference worked, return it with citation
         if inferred and "Not found in this document." not in inferred:
             return {
                 "answer": inferred,
@@ -418,124 +388,23 @@ Answer:
                 "navigation_path": [],
             }
 
-    # If we reach here, give a document-level failure message
-    fallback_msg = "Not found in this document." if DEFQ_RE.search(query or "") else "Not found in this section."
+    # If we reach here, no answer was found anywhere.
+    # Clear all citation fields — there is no valid section to cite for a not-found answer.
+    # Returning real section metadata here causes the UI to show citations like
+    # "[Section 2.3, pages 8-9]" next to "Not found", which is misleading.
+    fallback_msg = "Not found in this document." if DEFQ_RE.search(query or "") else "Not found in this document."
     return {
         "answer": fallback_msg,
-        "section": title or "—",
-        "structure": node.get("structure", "—"),
-        "start_page": s or "—",
-        "end_page": e or "—",
-        "node_id": node.get("node_id", "—"),
+        "section": "—",
+        "structure": "—",
+        "start_page": "—",
+        "end_page": "—",
+        "node_id": "—",
         "navigation_path": [],
     }
 
-
-def generate_answer_multi(query: str, nodes_with_paths: List[Tuple[Dict, List[str]]], pages) -> Dict[str, Any]:
-    """Generate an answer from the top-N nodes combined.
-
-    Combines summaries + raw text from every retrieved node into one prompt,
-    so questions that span multiple sections get a complete answer instead of
-    'Not found in this section.'
-    """
-    if not nodes_with_paths:
-        return {
-            "answer": "No relevant clause or section found.",
-            "section": "—", "structure": "—",
-            "start_page": "—", "end_page": "—",
-            "node_id": "—", "navigation_path": [],
-        }
-
-    # Build combined context from all nodes
-    parts = []
-    for node, _ in nodes_with_paths:
-        s, e = node.get("start_index"), node.get("end_index")
-        title = node.get("title", "")
-        raw   = get_page_text(pages, s, e)
-        sect  = (node.get("summary", "") + "\n\n" + raw).strip()
-        parts.append(f"[Section {node.get('structure')} – {title}]\n{sect}")
-
-    combined = "\n\n========\n\n".join(parts)
-    best_node, best_path = nodes_with_paths[0]
-
-    prompt = f"""
-You are a document assistant. Answer ONLY using the content below.
-Give a thorough, well-structured answer. If the answer is genuinely not present,
-reply exactly: "Not found in this document."
-
-Content:
-{combined[:8000]}
-
-Question: {query}
-Answer:
-"""
-    try:
-        ans = call_llm(prompt, max_tokens=1000)
-        if not ans or "[ERROR" in ans:
-            raise RuntimeError
-        ans = ans.strip()
-    except Exception:
-        ans = _extractive_fallback(query, combined)
-
-    if ans and "Not found in this document." not in ans and "Not found in this section." not in ans:
-        return {
-            "answer": ans,
-            "section": best_node.get("title", "—"),
-            "structure": best_node.get("structure", "—"),
-            "start_page": best_node.get("start_index", "—"),
-            "end_page": best_node.get("end_index", "—"),
-            "node_id": best_node.get("node_id", "—"),
-            "navigation_path": best_path,
-        }
-
-    # Concept inference fallback
-    term = _extract_concept_term(query)
-    if term:
-        expansion = None
-        if re.fullmatch(r"[A-Z0-9\-]{2,10}", term):
-            expansion = _find_acronym_expansion(term, pages)
-        if expansion:
-            inferred = f"{term} — {expansion}."
-        else:
-            evidence = _collect_evidence_for_term(
-                term, {"children": [n for n, _ in nodes_with_paths]}, pages, char_limit=3000
-            )
-            if len(evidence) < 400:
-                all_text = "\n\n---\n\n".join([t for _, t in pages])[:4000]
-                evidence = (evidence + "\n\n---\n\n" + all_text).strip()
-            inferred = _infer_from_evidence(query, evidence)
-
-        if inferred and "Not found in this document." not in inferred:
-            return {
-                "answer": inferred,
-                "section": best_node.get("title", "—"),
-                "structure": best_node.get("structure", "—"),
-                "start_page": best_node.get("start_index", "—"),
-                "end_page": best_node.get("end_index", "—"),
-                "node_id": best_node.get("node_id", "—"),
-                "navigation_path": best_path,
-            }
-
-    fallback_msg = "Not found in this document." if DEFQ_RE.search(query or "") else "Not found in this section."
-    return {
-        "answer": fallback_msg,
-        "section": best_node.get("title", "—"),
-        "structure": best_node.get("structure", "—"),
-        "start_page": best_node.get("start_index", "—"),
-        "end_page": best_node.get("end_index", "—"),
-        "node_id": best_node.get("node_id", "—"),
-        "navigation_path": best_path,
-    }
-
 def retrieve(query: str, tree_root: Dict, pages):
-    # Use top-3 nodes so broad questions that span multiple sections
-    # get a complete answer instead of 'Not found in this section.'
-    top_nodes = _pick_top_nodes(query, tree_root, top_n=3)
-    if not top_nodes:
-        return {
-            "answer": "No relevant clause or section found.",
-            "section": "—", "structure": "—",
-            "start_page": "—", "end_page": "—",
-            "node_id": "—", "navigation_path": [],
-        }
-    return generate_answer_multi(query, top_nodes, pages)
+    node, path = _pick_best_node(query, tree_root)
+    result = generate_answer(query, node, pages)
+    result["navigation_path"] = path if node else []
+    return result
