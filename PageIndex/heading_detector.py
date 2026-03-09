@@ -24,31 +24,12 @@ def _norm(t):
     t = re.sub(r"\s+", " ", t)
     return t[:150]
 
-# ---------------------------------------------------------------
-# BUG FIX: Detect whether a page is a TOC page.
-# The original code marked a page with <<TOC_BLOCK>> only when the
-# TOC block was found on page index 1 (page 2).  But the heading
-# regexes still ran on that same page, so every TOC entry like
-# "2.1. Problem definition" was registered as a real heading with
-# start_index = 2 (the TOC page).  Those phantom nodes then get the
-# TOC page text instead of their real section text.
-#
-# Fix: skip ALL heading detection on any page that contains a TOC block.
-# ---------------------------------------------------------------
-
-def _is_toc_page(text: str) -> bool:
-    """Return True if this page is (or contains) a table-of-contents block."""
-    return TOC_TAG in text
-
-
 def detect_headings(pages: List[Tuple[int, str]]):
     seen = {}
     out = []
 
-    # ---- Pass 1: collect headings, skipping TOC pages ----
     for p, text in pages:
-        # Skip pages that were tagged as TOC by the PDF parser
-        if _is_toc_page(text):
+        if TOC_TAG in text:
             continue
 
         for m in LINE_START.finditer(text):
